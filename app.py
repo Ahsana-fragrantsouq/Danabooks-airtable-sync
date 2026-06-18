@@ -1,0 +1,317 @@
+import os
+import time
+import requests
+from flask import Flask, request, jsonify
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
+
+app = Flask(__name__)
+
+# --- Config ---
+DANABOOKS_URL = "https://transactionhub.zerobook.shop/api/v1/transaction-history"
+DANABOOKS_TOKEN = os.environ.get("DANABOOKS_TOKEN", "05a73134437d576b7a5046085906bfa562f612bab843b50f5df439ae8f61bd70")
+DANABOOKS_IDENTIFIER = os.environ.get("DANABOOKS_IDENTIFIER", "thirdparty@danabooks.com")
+
+AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "app5gOqDt9aZrW5bV")
+AIRTABLE_TABLE_NAME = "French Inventories"
+
+IST = pytz.timezone("Asia/Kolkata")
+
+
+# ---------------------------------------------------------------------------
+# Dana Books helpers
+# ---------------------------------------------------------------------------
+
+def get_latest_purchase_price(sku):
+    """Fetch the latest purchase price from Dana Books for a given SKU."""
+    headers = {
+        "Authorization": DANABOOKS_TOKEN,
+        "Identifier": DANABOOKS_IDENTIFIER,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "itemsku": sku,
+        "opcode": "PUR",
+        "rows": 1
+    }
+    resp = requests.post(DANABOOKS_URL, json=payload, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    records = data.get("data", [])
+    if not records:
+        return None
+
+    price = records[0].get("item_price")
+    return float(price) if price is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Airtable helpers
+# ---------------------------------------------------------------------------
+
+def get_all_airtable_skus():
+    """
+    Fetch ALL records from French Inventories that have a SKU.
+    Returns list of dicts: [{"record_id": ..., "sku": ..., "current_cost": ...}, ...]
+    """
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(AIRTABLE_TABLE_NAME)}"
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+    params = {
+        "filterByFormula": "{SKU}!=''",
+        "fields[]": ["SKU", "Cost"],
+        "pageSize": 100
+    }
+
+    records = []
+    offset = None
+
+    while True:
+        if offset:
+            params["offset"] = offset
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        for rec in data.get("records", []):
+            sku = rec.get("fields", {}).get("SKU")
+            if sku:
+                # Cost may be absent (empty) or a number
+                current_cost = rec.get("fields", {}).get("Cost")
+                # Normalize to float or None for clean comparison
+                if current_cost is not None:
+                    try:
+                        current_cost = float(current_cost)
+                    except (ValueError, TypeError):
+                        current_cost = None
+                records.append({
+                    "record_id": rec["id"],
+                    "sku": sku,
+                    "current_cost": current_cost
+                })
+
+        offset = data.get("offset")
+        if not offset:
+            break
+
+    return records
+
+
+def update_airtable_cost(record_id, cost):
+    """Update the Cost field in Airtable for a given record ID."""
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(AIRTABLE_TABLE_NAME)}/{record_id}"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {"fields": {"Cost": cost}}
+    resp = requests.patch(url, json=payload, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Core sync job
+# ---------------------------------------------------------------------------
+
+def run_auto_sync():
+    """
+    Scheduled job:
+    1. Fetch ALL SKUs from Airtable French Inventories
+    2. For each, query Dana Books for latest purchase price
+    3. Only update Airtable if:
+       - Cost is currently empty, OR
+       - Dana Books price is different from current Airtable cost
+    """
+    print("[auto-sync] Starting scheduled cost sync...", flush=True)
+
+    try:
+        all_skus = get_all_airtable_skus()
+    except Exception as e:
+        print(f"[auto-sync] ERROR fetching Airtable SKUs: {e}", flush=True)
+        return
+
+    print(f"[auto-sync] Total SKUs to check: {len(all_skus)}", flush=True)
+
+    updated = 0
+    skipped_no_purchase = 0
+    skipped_no_change = 0
+    errors = 0
+
+    for item in all_skus:
+        sku = item["sku"]
+        record_id = item["record_id"]
+        current_cost = item["current_cost"]
+
+        try:
+            dana_price = get_latest_purchase_price(sku)
+
+            if dana_price is None:
+                # No purchase record in Dana Books for this SKU
+                skipped_no_purchase += 1
+                continue
+
+            if current_cost is not None and current_cost == dana_price:
+                # Price hasn't changed — no update needed
+                skipped_no_change += 1
+                continue
+
+            # Either cost is empty OR price has changed — update Airtable
+            update_airtable_cost(record_id, dana_price)
+            print(
+                f"[auto-sync] UPDATED {sku} | "
+                f"old={current_cost if current_cost is not None else 'empty'} → new={dana_price}",
+                flush=True
+            )
+            updated += 1
+
+        except Exception as e:
+            print(f"[auto-sync] ERROR {sku}: {e}", flush=True)
+            errors += 1
+
+        # Small delay to avoid hammering the Dana Books API
+        time.sleep(0.3)
+
+    print(
+        f"[auto-sync] Done. Updated={updated} | "
+        f"No purchase in Dana Books={skipped_no_purchase} | "
+        f"Price unchanged={skipped_no_change} | "
+        f"Errors={errors}",
+        flush=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scheduler — 9 AM, 2 PM, 8 PM IST
+# ---------------------------------------------------------------------------
+
+scheduler = BackgroundScheduler(timezone=IST)
+
+scheduler.add_job(
+    run_auto_sync,
+    trigger=CronTrigger(hour=9, minute=0, timezone=IST),
+    id="sync_9am",
+    name="Cost sync 9 AM IST"
+)
+scheduler.add_job(
+    run_auto_sync,
+    trigger=CronTrigger(hour=14, minute=0, timezone=IST),
+    id="sync_2pm",
+    name="Cost sync 2 PM IST"
+)
+scheduler.add_job(
+    run_auto_sync,
+    trigger=CronTrigger(hour=20, minute=0, timezone=IST),
+    id="sync_8pm",
+    name="Cost sync 8 PM IST"
+)
+
+scheduler.start()
+print("[scheduler] Cost sync scheduled at 9 AM, 2 PM, 8 PM IST", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Manual trigger endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/sync-cost", methods=["POST"])
+def sync_cost_manual():
+    """
+    Manually trigger cost sync for one or more specific SKUs.
+    Body: { "skus": ["DNG1024", "DNG1025"] }
+    Or single: { "sku": "DNG1024" }
+    """
+    body = request.get_json(force=True) or {}
+
+    if "skus" in body:
+        skus = body["skus"]
+    elif "sku" in body:
+        skus = [body["sku"]]
+    else:
+        return jsonify({"error": "Provide 'sku' or 'skus' in request body"}), 400
+
+    results = []
+    for sku in skus:
+        result = {"sku": sku}
+        try:
+            dana_price = get_latest_purchase_price(sku)
+            if dana_price is None:
+                result["status"] = "skipped"
+                result["reason"] = "No purchase records found in Dana Books"
+                results.append(result)
+                continue
+
+            result["dana_price"] = dana_price
+
+            # Find record in Airtable
+            url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(AIRTABLE_TABLE_NAME)}"
+            headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+            params = {
+                "filterByFormula": f"{{SKU}}='{sku}'",
+                "maxRecords": 1,
+                "fields[]": ["SKU", "Cost"]
+            }
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            resp.raise_for_status()
+            records = resp.json().get("records", [])
+
+            if not records:
+                result["status"] = "skipped"
+                result["reason"] = "SKU not found in Airtable French Inventories"
+                results.append(result)
+                continue
+
+            record_id = records[0]["id"]
+            current_cost = records[0].get("fields", {}).get("Cost")
+
+            # Normalize current cost
+            if current_cost is not None:
+                try:
+                    current_cost = float(current_cost)
+                except (ValueError, TypeError):
+                    current_cost = None
+
+            result["previous_cost"] = current_cost
+
+            # Only update if empty or changed
+            if current_cost is not None and current_cost == dana_price:
+                result["status"] = "skipped"
+                result["reason"] = "Price unchanged"
+                results.append(result)
+                continue
+
+            update_airtable_cost(record_id, dana_price)
+            result["status"] = "updated"
+            result["new_cost"] = dana_price
+
+        except Exception as e:
+            result["status"] = "error"
+            result["reason"] = str(e)
+
+        results.append(result)
+        print(f"[manual-sync] {result}", flush=True)
+
+    return jsonify({"results": results}), 200
+
+
+@app.route("/sync-all", methods=["POST"])
+def sync_all_now():
+    """Manually trigger the full auto sync job immediately."""
+    import threading
+    threading.Thread(target=run_auto_sync, daemon=True).start()
+    return jsonify({"message": "Full sync started in background"}), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    jobs = [
+        {"id": j.id, "name": j.name, "next_run": str(j.next_run_time)}
+        for j in scheduler.get_jobs()
+    ]
+    return jsonify({"status": "ok", "scheduled_jobs": jobs}), 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
