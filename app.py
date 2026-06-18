@@ -35,7 +35,7 @@ def get_latest_purchase_price(sku):
     """Fetch the latest purchase price from Dana Books for a given SKU.
     Retries up to MAX_RETRIES times on 429 rate limit errors."""
     headers = {
-        "Authorization": DANABOOKS_TOKEN,
+        "Authorization": f"Bearer {DANABOOKS_TOKEN}",
         "Identifier": DANABOOKS_IDENTIFIER,
         "Content-Type": "application/json"
     }
@@ -212,7 +212,7 @@ scheduler.add_job(
 )
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=16, minute=10, timezone=IST),
+    trigger=CronTrigger(hour=14, minute=0, timezone=IST),
     id="sync_2pm",
     name="Cost sync 2 PM IST"
 )
