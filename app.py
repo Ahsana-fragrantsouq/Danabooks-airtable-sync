@@ -195,9 +195,10 @@ scheduler.add_job(
     id="sync_9am",
     name="Cost sync 9 AM IST"
 )
+# change time from 2 hour 0 minute
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=14, minute=0, timezone=IST),
+    trigger=CronTrigger(hour=15, minute=45, timezone=IST),
     id="sync_2pm",
     name="Cost sync 2 PM IST"
 )
