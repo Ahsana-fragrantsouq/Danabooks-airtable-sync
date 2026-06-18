@@ -199,7 +199,7 @@ def run_auto_sync():
 
 
 # ---------------------------------------------------------------------------
-# Scheduler — 9 AM, 2 PM, 8 PM IST
+# Scheduler — 9 AM, 2 PM, 7 PM IST
 # ---------------------------------------------------------------------------
 
 scheduler = BackgroundScheduler(timezone=IST)
@@ -218,13 +218,13 @@ scheduler.add_job(
 )
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=20, minute=0, timezone=IST),
-    id="sync_8pm",
-    name="Cost sync 8 PM IST"
+    trigger=CronTrigger(hour=19, minute=0, timezone=IST),
+    id="sync_7pm",
+    name="Cost sync 7 PM IST"
 )
 
 scheduler.start()
-print("[scheduler] Cost sync scheduled at 9 AM, 2 PM, 8 PM IST", flush=True)
+print("[scheduler] Cost sync scheduled at 9 AM, 2 PM, 7 PM IST", flush=True)
 
 
 # ---------------------------------------------------------------------------
