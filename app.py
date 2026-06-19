@@ -77,6 +77,7 @@ def get_all_airtable_skus():
     """
     Fetch ALL records from French Inventories that have a SKU.
     Returns list of dicts: [{"record_id": ..., "sku": ..., "current_cost": ...}, ...]
+    Retries each page up to 3 times on timeout/connection errors.
     """
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(AIRTABLE_TABLE_NAME)}"
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
@@ -92,8 +93,20 @@ def get_all_airtable_skus():
     while True:
         if offset:
             params["offset"] = offset
-        resp = requests.get(url, headers=headers, params=params, timeout=15)
-        resp.raise_for_status()
+
+        resp = None
+        for attempt in range(1, 4):
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=30)
+                resp.raise_for_status()
+                break
+            except requests.exceptions.RequestException as e:
+                print(f"[airtable-fetch] Attempt {attempt}/3 failed: {e}", flush=True)
+                if attempt < 3:
+                    time.sleep(5)
+                else:
+                    raise
+
         data = resp.json()
 
         for rec in data.get("records", []):
@@ -199,7 +212,7 @@ def run_auto_sync():
 
 
 # ---------------------------------------------------------------------------
-# Scheduler — 9 AM, 2 PM, 7 PM IST
+# Scheduler — 9 AM, 2 PM, 8 PM IST
 # ---------------------------------------------------------------------------
 
 scheduler = BackgroundScheduler(timezone=IST)
@@ -218,13 +231,13 @@ scheduler.add_job(
 )
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=19, minute=0, timezone=IST),
-    id="sync_7pm",
-    name="Cost sync 7 PM IST"
+    trigger=CronTrigger(hour=20, minute=0, timezone=IST),
+    id="sync_8pm",
+    name="Cost sync 8 PM IST"
 )
 
 scheduler.start()
-print("[scheduler] Cost sync scheduled at 9 AM, 2 PM, 7 PM IST", flush=True)
+print("[scheduler] Cost sync scheduled at 9 AM, 2 PM, 8 PM IST", flush=True)
 
 
 # ---------------------------------------------------------------------------
