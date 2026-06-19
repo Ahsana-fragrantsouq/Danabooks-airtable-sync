@@ -155,6 +155,15 @@ def run_auto_sync():
     2. For each, query Dana Books for latest purchase price
     3. Only update Airtable if Cost is empty OR Dana Books price has changed
     """
+    try:
+        _run_auto_sync_inner()
+    except Exception as e:
+        import traceback
+        print(f"[auto-sync] FATAL UNCAUGHT ERROR: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+
+
+def _run_auto_sync_inner():
     print("[auto-sync] Starting scheduled cost sync...", flush=True)
 
     if not DANABOOKS_TOKEN:
@@ -174,7 +183,7 @@ def run_auto_sync():
     skipped_no_change = 0
     errors = 0
 
-    for item in all_skus:
+    for idx, item in enumerate(all_skus, start=1):
         sku = item["sku"]
         record_id = item["record_id"]
         current_cost = item["current_cost"]
@@ -199,6 +208,10 @@ def run_auto_sync():
             print(f"[auto-sync] ERROR {sku}: {e}", flush=True)
             errors += 1
 
+        # Heartbeat every 100 SKUs so we can see the job is alive in logs
+        if idx % 100 == 0:
+            print(f"[auto-sync] Progress: {idx}/{len(all_skus)} checked...", flush=True)
+
         # Delay between each Dana Books API call to avoid rate limiting
         time.sleep(DANA_REQUEST_DELAY)
 
@@ -219,7 +232,7 @@ scheduler = BackgroundScheduler(timezone=IST)
 
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=11, minute=15, timezone=IST),
+    trigger=CronTrigger(hour=9, minute=0, timezone=IST),
     id="sync_9am",
     name="Cost sync 9 AM IST"
 )
@@ -231,9 +244,9 @@ scheduler.add_job(
 )
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=19, minute=0, timezone=IST),
-    id="sync_7pm",
-    name="Cost sync 7 PM IST"
+    trigger=CronTrigger(hour=20, minute=0, timezone=IST),
+    id="sync_8pm",
+    name="Cost sync 8 PM IST"
 )
 
 scheduler.start()
