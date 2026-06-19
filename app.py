@@ -21,10 +21,10 @@ AIRTABLE_TABLE_NAME = "French Inventories"
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# Number of SKUs processed in parallel
-PARALLEL_WORKERS = 5
-# Small stagger delay within each worker between its own calls (seconds)
-DANA_REQUEST_DELAY = 0.3
+# Number of SKUs processed in parallel (Dana Books rejects true parallel calls, keep at 1)
+PARALLEL_WORKERS = 1
+# Delay between Dana Books API calls (seconds)
+DANA_REQUEST_DELAY = 1.0
 # Max retries on 429
 MAX_RETRIES = 3
 # Wait time on 429 before retry (seconds)
