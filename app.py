@@ -1,6 +1,8 @@
 import os
 import time
+import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -19,12 +21,17 @@ AIRTABLE_TABLE_NAME = "French Inventories"
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# Delay between Dana Books API calls (seconds)
-DANA_REQUEST_DELAY = 1.0
+# Number of SKUs processed in parallel
+PARALLEL_WORKERS = 5
+# Small stagger delay within each worker between its own calls (seconds)
+DANA_REQUEST_DELAY = 0.3
 # Max retries on 429
 MAX_RETRIES = 3
 # Wait time on 429 before retry (seconds)
 RETRY_WAIT = 10
+
+# Thread-safe counters
+_progress_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +170,47 @@ def run_auto_sync():
         print(traceback.format_exc(), flush=True)
 
 
+def _process_one_sku(item, counters):
+    """
+    Worker function: process a single SKU end-to-end.
+    Returns a status string and updates shared counters dict (thread-safe).
+    """
+    sku = item["sku"]
+    record_id = item["record_id"]
+    current_cost = item["current_cost"]
+
+    try:
+        dana_price = get_latest_purchase_price(sku)
+
+        if dana_price is None:
+            status = "skipped_no_purchase"
+        elif current_cost is not None and current_cost == dana_price:
+            status = "skipped_no_change"
+        else:
+            update_airtable_cost(record_id, dana_price)
+            print(
+                f"[auto-sync] UPDATED {sku} | "
+                f"old={current_cost if current_cost is not None else 'empty'} → new={dana_price}",
+                flush=True
+            )
+            status = "updated"
+
+    except Exception as e:
+        print(f"[auto-sync] ERROR {sku}: {e}", flush=True)
+        status = "error"
+
+    # Small stagger so this worker doesn't immediately fire its next call
+    time.sleep(DANA_REQUEST_DELAY)
+
+    with _progress_lock:
+        counters["done"] += 1
+        counters[status] += 1
+        if counters["done"] % 100 == 0:
+            print(f"[auto-sync] Progress: {counters['done']}/{counters['total']} checked...", flush=True)
+
+    return status
+
+
 def _run_auto_sync_inner():
     print("[auto-sync] Starting scheduled cost sync...", flush=True)
 
@@ -177,49 +225,32 @@ def _run_auto_sync_inner():
         return
 
     print(f"[auto-sync] Total SKUs to check: {len(all_skus)}", flush=True)
+    print(f"[auto-sync] Running with {PARALLEL_WORKERS} parallel workers", flush=True)
 
-    updated = 0
-    skipped_no_purchase = 0
-    skipped_no_change = 0
-    errors = 0
+    counters = {
+        "done": 0,
+        "total": len(all_skus),
+        "updated": 0,
+        "skipped_no_purchase": 0,
+        "skipped_no_change": 0,
+        "error": 0,
+    }
 
-    for idx, item in enumerate(all_skus, start=1):
-        sku = item["sku"]
-        record_id = item["record_id"]
-        current_cost = item["current_cost"]
-
-        try:
-            dana_price = get_latest_purchase_price(sku)
-
-            if dana_price is None:
-                skipped_no_purchase += 1
-            elif current_cost is not None and current_cost == dana_price:
-                skipped_no_change += 1
-            else:
-                update_airtable_cost(record_id, dana_price)
-                print(
-                    f"[auto-sync] UPDATED {sku} | "
-                    f"old={current_cost if current_cost is not None else 'empty'} → new={dana_price}",
-                    flush=True
-                )
-                updated += 1
-
-        except Exception as e:
-            print(f"[auto-sync] ERROR {sku}: {e}", flush=True)
-            errors += 1
-
-        # Heartbeat every 100 SKUs so we can see the job is alive in logs
-        if idx % 100 == 0:
-            print(f"[auto-sync] Progress: {idx}/{len(all_skus)} checked...", flush=True)
-
-        # Delay between each Dana Books API call to avoid rate limiting
-        time.sleep(DANA_REQUEST_DELAY)
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+        futures = [executor.submit(_process_one_sku, item, counters) for item in all_skus]
+        for future in as_completed(futures):
+            # Exceptions are already caught inside _process_one_sku,
+            # but guard here too in case something unexpected slips through.
+            try:
+                future.result()
+            except Exception as e:
+                print(f"[auto-sync] Worker crashed unexpectedly: {e}", flush=True)
 
     print(
-        f"[auto-sync] Done. Updated={updated} | "
-        f"No purchase in Dana Books={skipped_no_purchase} | "
-        f"Price unchanged={skipped_no_change} | "
-        f"Errors={errors}",
+        f"[auto-sync] Done. Updated={counters['updated']} | "
+        f"No purchase in Dana Books={counters['skipped_no_purchase']} | "
+        f"Price unchanged={counters['skipped_no_change']} | "
+        f"Errors={counters['error']}",
         flush=True
     )
 
@@ -232,7 +263,7 @@ scheduler = BackgroundScheduler(timezone=IST)
 
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=11, minute=50, timezone=IST),
+    trigger=CronTrigger(hour=9, minute=0, timezone=IST),
     id="sync_9am",
     name="Cost sync 9 AM IST"
 )
@@ -337,7 +368,6 @@ def sync_cost_manual():
 @app.route("/sync-all", methods=["POST"])
 def sync_all_now():
     """Manually trigger the full auto sync job immediately."""
-    import threading
     threading.Thread(target=run_auto_sync, daemon=True).start()
     return jsonify({"message": "Full sync started in background"}), 200
 
