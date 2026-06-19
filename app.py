@@ -219,7 +219,7 @@ scheduler = BackgroundScheduler(timezone=IST)
 
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=9, minute=0, timezone=IST),
+    trigger=CronTrigger(hour=11, minute=15, timezone=IST),
     id="sync_9am",
     name="Cost sync 9 AM IST"
 )
@@ -231,9 +231,9 @@ scheduler.add_job(
 )
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=20, minute=0, timezone=IST),
-    id="sync_8pm",
-    name="Cost sync 8 PM IST"
+    trigger=CronTrigger(hour=19, minute=0, timezone=IST),
+    id="sync_7pm",
+    name="Cost sync 7 PM IST"
 )
 
 scheduler.start()
