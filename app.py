@@ -180,7 +180,7 @@ def update_airtable_cost(record_id, cost):
         "Content-Type": "application/json"
     }
     payload = {"fields": {"Cost": cost}}
-    resp = requests.patch(url, json=payload, headers=headers, timeout=15)
+    resp = requests.patch(url, json=payload, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -297,7 +297,7 @@ scheduler.add_job(
 )
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=16, minute=15, timezone=IST),
+    trigger=CronTrigger(hour=14, minute=0, timezone=IST),
     id="sync_2pm",
     name="Cost sync 2 PM IST"
 )
@@ -357,7 +357,7 @@ def sync_cost_manual():
                 "maxRecords": 1,
                 "fields[]": ["SKU", "Cost"]
             }
-            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
             resp.raise_for_status()
             records = resp.json().get("records", [])
 
