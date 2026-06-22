@@ -22,9 +22,9 @@ AIRTABLE_TABLE_NAME = "French Inventories"
 IST = pytz.timezone("Asia/Kolkata")
 
 # Number of SKUs per Dana Books batch request
-BATCH_SIZE = 50
+BATCH_SIZE = 500
 # Delay between batch requests (seconds)
-BATCH_DELAY = 2.0
+BATCH_DELAY = 1.0
 # Max retries on 429/520
 MAX_RETRIES = 3
 # Wait time before retry (seconds)
@@ -297,7 +297,7 @@ scheduler.add_job(
 )
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=16, minute=0, timezone=IST),
+    trigger=CronTrigger(hour=16, minute=15, timezone=IST),
     id="sync_2pm",
     name="Cost sync 2 PM IST"
 )
