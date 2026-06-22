@@ -21,10 +21,10 @@ AIRTABLE_TABLE_NAME = "French Inventories"
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# Number of SKUs processed in parallel (Dana Books rejects true parallel calls, keep at 1)
-PARALLEL_WORKERS = 1
-# Delay between Dana Books API calls (seconds)
-DANA_REQUEST_DELAY = 1.0
+# Number of SKUs per Dana Books batch request
+BATCH_SIZE = 50
+# Delay between batch requests (seconds)
+BATCH_DELAY = 2.0
 # Max retries on 429/520
 MAX_RETRIES = 3
 # Wait time before retry (seconds)
@@ -38,26 +38,27 @@ _progress_lock = threading.Lock()
 # Dana Books helpers
 # ---------------------------------------------------------------------------
 
-def get_latest_purchase_price(sku):
-    """Fetch the latest purchase price from Dana Books for a given SKU.
-    Retries up to MAX_RETRIES times on 429 (rate limit) and 520 (Cloudflare) errors."""
+def get_prices_for_batch(skus):
+    """
+    Fetch latest purchase prices from Dana Books for a batch of SKUs.
+    Returns dict: { sku: float_price_or_None, ... }
+    """
     headers = {
         "Authorization": f"Bearer {DANABOOKS_TOKEN}",
         "Identifier": DANABOOKS_IDENTIFIER,
         "Content-Type": "application/json"
     }
     payload = {
-        "itemsku": sku,
-        "opcode": "PUR",
-        "rows": 1
+        "itemsku": skus,
+        "opcode": "PUR"
     }
 
     for attempt in range(1, MAX_RETRIES + 1):
-        resp = requests.post(DANABOOKS_URL, json=payload, headers=headers, timeout=15)
+        resp = requests.post(DANABOOKS_URL, json=payload, headers=headers, timeout=30)
 
         if resp.status_code == 429:
             if attempt < MAX_RETRIES:
-                print(f"[dana] 429 Rate limit on {sku}, waiting {RETRY_WAIT}s (attempt {attempt}/{MAX_RETRIES})", flush=True)
+                print(f"[dana] 429 Rate limit, waiting {RETRY_WAIT}s (attempt {attempt}/{MAX_RETRIES})", flush=True)
                 time.sleep(RETRY_WAIT)
                 continue
             else:
@@ -65,35 +66,48 @@ def get_latest_purchase_price(sku):
 
         if resp.status_code == 520:
             if attempt < MAX_RETRIES:
-                print(f"[dana] 520 Cloudflare error on {sku}, waiting {RETRY_WAIT}s (attempt {attempt}/{MAX_RETRIES})", flush=True)
+                print(f"[dana] 520 Cloudflare error, waiting {RETRY_WAIT}s (attempt {attempt}/{MAX_RETRIES})", flush=True)
                 time.sleep(RETRY_WAIT)
                 continue
             else:
-                print(f"[dana] 520 Cloudflare error on {sku} after {MAX_RETRIES} attempts, skipping", flush=True)
-                return None
+                print(f"[dana] 520 Cloudflare error after {MAX_RETRIES} attempts, skipping batch", flush=True)
+                return {sku: None for sku in skus}
 
         resp.raise_for_status()
         data = resp.json()
 
-        records = data.get("data", [])
-        if not records or not isinstance(records, list):
-            return None
+        # Response: { "data": { "SKU1": [...records], "SKU2": [...records] } }
+        sku_data = data.get("data", {})
+        if not isinstance(sku_data, dict):
+            return {sku: None for sku in skus}
 
-        first_record = records[0]
-        if not isinstance(first_record, dict):
-            return None
+        result = {}
+        for sku in skus:
+            records = sku_data.get(sku, [])
+            if not records or not isinstance(records, list):
+                result[sku] = None
+                continue
 
-        price = first_record.get("item_price")
-        if price is None:
-            return None
+            # Records are returned newest first — take the first one
+            first_record = records[0]
+            if not isinstance(first_record, dict):
+                result[sku] = None
+                continue
 
-        try:
-            return float(price)
-        except (ValueError, TypeError):
-            print(f"[dana] WARNING: non-numeric item_price for {sku}: {price!r}", flush=True)
-            return None
+            price = first_record.get("item_price")
+            if price is None:
+                result[sku] = None
+                continue
 
-    return None
+            try:
+                result[sku] = float(price)
+            except (ValueError, TypeError):
+                print(f"[dana] WARNING: non-numeric item_price for {sku}: {price!r}", flush=True)
+                result[sku] = None
+
+        return result
+
+    return {sku: None for sku in skus}
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +193,7 @@ def run_auto_sync():
     """
     Scheduled job:
     1. Fetch ALL SKUs from Airtable French Inventories
-    2. For each, query Dana Books for latest purchase price
+    2. For each batch of BATCH_SIZE SKUs, query Dana Books for latest purchase prices
     3. Only update Airtable if Cost is empty OR Dana Books price has changed
     """
     try:
@@ -188,47 +202,6 @@ def run_auto_sync():
         import traceback
         print(f"[auto-sync] FATAL UNCAUGHT ERROR: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
-
-
-def _process_one_sku(item, counters):
-    """
-    Worker function: process a single SKU end-to-end.
-    Returns a status string and updates shared counters dict (thread-safe).
-    """
-    sku = item["sku"]
-    record_id = item["record_id"]
-    current_cost = item["current_cost"]
-
-    try:
-        dana_price = get_latest_purchase_price(sku)
-
-        if dana_price is None:
-            status = "skipped_no_purchase"
-        elif current_cost is not None and current_cost == dana_price:
-            status = "skipped_no_change"
-        else:
-            update_airtable_cost(record_id, dana_price)
-            print(
-                f"[auto-sync] UPDATED {sku} | "
-                f"old={current_cost if current_cost is not None else 'empty'} → new={dana_price}",
-                flush=True
-            )
-            status = "updated"
-
-    except Exception as e:
-        print(f"[auto-sync] ERROR {sku}: {type(e).__name__}: {e}", flush=True)
-        status = "error"
-
-    # Delay between Dana Books API calls
-    time.sleep(DANA_REQUEST_DELAY)
-
-    with _progress_lock:
-        counters["done"] += 1
-        counters[status] += 1
-        if counters["done"] % 100 == 0:
-            print(f"[auto-sync] Progress: {counters['done']}/{counters['total']} checked...", flush=True)
-
-    return status
 
 
 def _run_auto_sync_inner():
@@ -244,31 +217,68 @@ def _run_auto_sync_inner():
         print(f"[auto-sync] ERROR fetching Airtable SKUs: {e}", flush=True)
         return
 
-    print(f"[auto-sync] Total SKUs to check: {len(all_skus)}", flush=True)
-    print(f"[auto-sync] Running with {PARALLEL_WORKERS} parallel workers", flush=True)
+    total = len(all_skus)
+    print(f"[auto-sync] Total SKUs to check: {total}", flush=True)
+    print(f"[auto-sync] Batch size: {BATCH_SIZE} SKUs per request", flush=True)
 
-    counters = {
-        "done": 0,
-        "total": len(all_skus),
-        "updated": 0,
-        "skipped_no_purchase": 0,
-        "skipped_no_change": 0,
-        "error": 0,
-    }
+    updated = 0
+    skipped_no_purchase = 0
+    skipped_no_change = 0
+    errors = 0
+    done = 0
 
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
-        futures = [executor.submit(_process_one_sku, item, counters) for item in all_skus]
-        for future in as_completed(futures):
+    # Build a lookup dict for quick access: sku -> item
+    sku_map = {item["sku"]: item for item in all_skus}
+
+    # Process in batches
+    sku_list = list(sku_map.keys())
+    for i in range(0, len(sku_list), BATCH_SIZE):
+        batch_skus = sku_list[i:i + BATCH_SIZE]
+
+        try:
+            prices = get_prices_for_batch(batch_skus)
+        except Exception as e:
+            print(f"[auto-sync] ERROR fetching batch {i//BATCH_SIZE + 1}: {type(e).__name__}: {e}", flush=True)
+            errors += len(batch_skus)
+            done += len(batch_skus)
+            continue
+
+        for sku in batch_skus:
+            item = sku_map[sku]
+            record_id = item["record_id"]
+            current_cost = item["current_cost"]
+            dana_price = prices.get(sku)
+
             try:
-                future.result()
+                if dana_price is None:
+                    skipped_no_purchase += 1
+                elif current_cost is not None and current_cost == dana_price:
+                    skipped_no_change += 1
+                else:
+                    update_airtable_cost(record_id, dana_price)
+                    print(
+                        f"[auto-sync] UPDATED {sku} | "
+                        f"old={current_cost if current_cost is not None else 'empty'} → new={dana_price}",
+                        flush=True
+                    )
+                    updated += 1
             except Exception as e:
-                print(f"[auto-sync] Worker crashed unexpectedly: {e}", flush=True)
+                print(f"[auto-sync] ERROR updating {sku}: {type(e).__name__}: {e}", flush=True)
+                errors += 1
+
+            done += 1
+
+        if done % 500 == 0 or done == total:
+            print(f"[auto-sync] Progress: {done}/{total} checked...", flush=True)
+
+        # Delay between batch requests
+        time.sleep(BATCH_DELAY)
 
     print(
-        f"[auto-sync] Done. Updated={counters['updated']} | "
-        f"No purchase in Dana Books={counters['skipped_no_purchase']} | "
-        f"Price unchanged={counters['skipped_no_change']} | "
-        f"Errors={counters['error']}",
+        f"[auto-sync] Done. Updated={updated} | "
+        f"No purchase in Dana Books={skipped_no_purchase} | "
+        f"Price unchanged={skipped_no_change} | "
+        f"Errors={errors}",
         flush=True
     )
 
@@ -281,7 +291,7 @@ scheduler = BackgroundScheduler(timezone=IST)
 
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=11, minute=7, timezone=IST),
+    trigger=CronTrigger(hour=9, minute=0, timezone=IST),
     id="sync_9am",
     name="Cost sync 9 AM IST"
 )
@@ -323,10 +333,15 @@ def sync_cost_manual():
         return jsonify({"error": "Provide 'sku' or 'skus' in request body"}), 400
 
     results = []
+    try:
+        prices = get_prices_for_batch(skus)
+    except Exception as e:
+        return jsonify({"error": f"Dana Books API error: {type(e).__name__}: {e}"}), 500
+
     for sku in skus:
         result = {"sku": sku}
         try:
-            dana_price = get_latest_purchase_price(sku)
+            dana_price = prices.get(sku)
             if dana_price is None:
                 result["status"] = "skipped"
                 result["reason"] = "No purchase records found in Dana Books"
