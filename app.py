@@ -25,9 +25,9 @@ IST = pytz.timezone("Asia/Kolkata")
 PARALLEL_WORKERS = 1
 # Delay between Dana Books API calls (seconds)
 DANA_REQUEST_DELAY = 1.0
-# Max retries on 429
+# Max retries on 429/520
 MAX_RETRIES = 3
-# Wait time on 429 before retry (seconds)
+# Wait time before retry (seconds)
 RETRY_WAIT = 10
 
 # Thread-safe counters
@@ -40,7 +40,7 @@ _progress_lock = threading.Lock()
 
 def get_latest_purchase_price(sku):
     """Fetch the latest purchase price from Dana Books for a given SKU.
-    Retries up to MAX_RETRIES times on 429 rate limit errors."""
+    Retries up to MAX_RETRIES times on 429 (rate limit) and 520 (Cloudflare) errors."""
     headers = {
         "Authorization": f"Bearer {DANABOOKS_TOKEN}",
         "Identifier": DANABOOKS_IDENTIFIER,
@@ -63,15 +63,35 @@ def get_latest_purchase_price(sku):
             else:
                 resp.raise_for_status()
 
+        if resp.status_code == 520:
+            if attempt < MAX_RETRIES:
+                print(f"[dana] 520 Cloudflare error on {sku}, waiting {RETRY_WAIT}s (attempt {attempt}/{MAX_RETRIES})", flush=True)
+                time.sleep(RETRY_WAIT)
+                continue
+            else:
+                print(f"[dana] 520 Cloudflare error on {sku} after {MAX_RETRIES} attempts, skipping", flush=True)
+                return None
+
         resp.raise_for_status()
         data = resp.json()
 
         records = data.get("data", [])
-        if not records:
+        if not records or not isinstance(records, list):
             return None
 
-        price = records[0].get("item_price")
-        return float(price) if price is not None else None
+        first_record = records[0]
+        if not isinstance(first_record, dict):
+            return None
+
+        price = first_record.get("item_price")
+        if price is None:
+            return None
+
+        try:
+            return float(price)
+        except (ValueError, TypeError):
+            print(f"[dana] WARNING: non-numeric item_price for {sku}: {price!r}", flush=True)
+            return None
 
     return None
 
@@ -196,10 +216,10 @@ def _process_one_sku(item, counters):
             status = "updated"
 
     except Exception as e:
-        print(f"[auto-sync] ERROR {sku}: {e}", flush=True)
+        print(f"[auto-sync] ERROR {sku}: {type(e).__name__}: {e}", flush=True)
         status = "error"
 
-    # Small stagger so this worker doesn't immediately fire its next call
+    # Delay between Dana Books API calls
     time.sleep(DANA_REQUEST_DELAY)
 
     with _progress_lock:
@@ -239,8 +259,6 @@ def _run_auto_sync_inner():
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
         futures = [executor.submit(_process_one_sku, item, counters) for item in all_skus]
         for future in as_completed(futures):
-            # Exceptions are already caught inside _process_one_sku,
-            # but guard here too in case something unexpected slips through.
             try:
                 future.result()
             except Exception as e:
@@ -357,7 +375,7 @@ def sync_cost_manual():
 
         except Exception as e:
             result["status"] = "error"
-            result["reason"] = str(e)
+            result["reason"] = f"{type(e).__name__}: {e}"
 
         results.append(result)
         print(f"[manual-sync] {result}", flush=True)
