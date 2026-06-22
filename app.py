@@ -297,7 +297,7 @@ scheduler.add_job(
 )
 scheduler.add_job(
     run_auto_sync,
-    trigger=CronTrigger(hour=14, minute=0, timezone=IST),
+    trigger=CronTrigger(hour=16, minute=0, timezone=IST),
     id="sync_2pm",
     name="Cost sync 2 PM IST"
 )
